@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+# The mimi-os workspace: a plain folder holding this launch repo and, beside it, the repos of one profile.
+#
+#   mimi-launch server [dir] [flags]   protocol, gateway: install, build, the gateway under pm2 (once it answers
+#                                      its health check and stays up 15 s, pm2 save), the ~/.local/bin/mimi command;
+#                                      in a terminal it first asks for the public URL the app dials (Enter skips)
+#       --public-url <url>             set that URL without asking (mimi public-url <url> changes it later)
+#   mimi-launch agents [dir] [flags]   protocol, sdk, plugins: install, build, typecheck (tests included); runs nothing
+#   mimi-launch devkit [dir] [flags]   protocol, sdk, plugins, gateway, devkit: install, build, typecheck (tests
+#                                      included), the mimi command; mimi-dev up runs the gateway
+#   mimi-launch update [--test] [--fast] [--no-restart]
+#                                      pull launch and every repo of the profile, clone the missing ones, install,
+#                                      build; typecheck on agents and devkit; on a server, restart pm2 and save
+#                                      once the gateway passes its health check
+#       --test                         also run the tests (not on a server: tests run where the sdk is)
+#       --fast                         skip the typecheck
+#       --no-restart                   leave pm2 alone
+#   mimi-launch check                  fetch every repo of the profile, list the commits a pull would bring; changes nothing
+#   mimi-launch status                 profile, branch, uncommitted files, ahead and behind of every repo of the profile
+#   mimi-launch reset                  back up, then after a typed RESET wipe gateway/mimi, the gateway's state
+#                                      (server, devkit; mimi-dev keeps its own in the agent's .mimi-dev)
+#
+# Downloaded on its own, a profile first clones launch into dir/launch (dir defaults to ~/mimi-os) and runs from there.
+# A profile run in an existing workspace switches it: repos only the old profile used stay as they are.
+# The mimi command runs the gateway CLI of the workspace that wrote it: setup writes it before anything is built, an
+# update replaces it when it is missing or names a workspace with no gateway CLI, and switching to agents removes it.
+# MIMI_GIT_BASE overrides where the repos come from, e.g. git@github.com:Mimi-agent-os
+set -euo pipefail
+
+# bash reads a script as it runs and `update` pulls this file: all code is in functions, called from the last line
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 2; }
+
+preflight() {
+    command -v git >/dev/null || { echo "git not found on PATH" >&2; exit 1; }
+    command -v node >/dev/null || { echo "node not found on PATH: install Node.js 24 or newer" >&2; exit 1; }
+    node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)' \
+        || { echo "Node.js 24 or newer is required (found $(node -v))" >&2; exit 1; }
+    command -v pnpm >/dev/null || { echo "pnpm not found on PATH: run corepack enable pnpm (or npm i -g pnpm)" >&2; exit 1; }
+}
+
+need_workspace() {
+    [ -f "$LAUNCH/repos" ] || { echo "$LAUNCH is not a launch checkout: run mimi-launch server|agents|devkit first" >&2; exit 1; }
+    # a repo name is a folder here: no path may lead out of the workspace
+    awk '!/^[[:space:]]*(#|$)/ && $1 !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { print "repos line " NR ": " $1 " is not a plain repo name" > "/dev/stderr"; bad = 1 } END { exit bad }' "$LAUNCH/repos" \
+        || { echo "fix $LAUNCH/repos (git -C $(printf %q "$LAUNCH") pull brings a fixed one), then run again" >&2; exit 1; }
+}
+
+# `repos`: one line per repo, "name profiles url"; a url without a scheme is relative to $BASE
+repo_lines() { grep -Ev '^[[:space:]]*(#|$)' "$LAUNCH/repos"; }
+
+profile() { cat "$WS/.mimi-profile" 2>/dev/null || echo none; }
+
+# launch must sit in a folder named launch, beside the repos, and hold no profile
+not_beside_workspace() {
+    local profile
+    profile="$(cat "$1/.mimi-profile" 2>/dev/null || echo "server|agents|devkit")"
+    echo "$1 is not a launch checkout beside a workspace: git clone $BASE/launch.git <workspace>/launch, then <workspace>/launch/mimi-launch $profile" >&2
+    exit 1
+}
+
+# the repos of this workspace's profile, in the order of `repos`, which is the build order
+profile_repos() {
+    local current name profiles
+    current="$(profile)"
+    repo_lines | while read -r name profiles _; do
+        case ",$profiles," in *",$current,"*) echo "$name" ;; esac
+    done
+}
+
+# launch first, then every repo of the profile that is cloned
+present_repos() {
+    local name
+    echo launch
+    for name in $(profile_repos); do
+        if [ -e "$WS/$name/.git" ]; then echo "$name"; fi
+    done
+}
+
+dir_of() { if [ "$1" = launch ]; then echo "$LAUNCH"; else echo "$WS/$1"; fi; }
+
+# every package of the profile, in build order
+packages() {
+    local name
+    for name in $(profile_repos); do
+        if [ -f "$WS/$name/package.json" ]; then echo "$name"; fi
+    done
+}
+
+# ---------------------------------------------------------------- server | agents | devkit
+
+setup() {
+    local profile="$1" dir="" flags=() url_given=0
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --public-url)
+                if [ $# -lt 2 ]; then echo "--public-url needs a URL" >&2; exit 2; fi
+                PUBLIC_URL="$2" url_given=1
+                shift
+                ;;
+            --*) flags+=("$1") ;;
+            *) if [ -n "$dir" ]; then echo "one dir at most: got $dir and $1" >&2; exit 2; fi; dir="$1" ;;
+        esac
+        shift
+    done
+    # a bad flag stops here, before anything is cloned or the profile switches
+    update_flags "$profile" ${flags[@]+"${flags[@]}"}
+    if [[ $dir == *://* || $dir == git@* ]]; then
+        echo "\"$dir\" is a URL: $profile takes the workspace folder (e.g. ~/mimi-os); the repos come from $BASE" >&2
+        exit 2
+    fi
+    # pnpm puts node_modules/.bin on PATH, where a ':' in the folder splits the entry and loses tsc
+    if [[ $dir == *:* ]]; then echo "\"$dir\" has a ':', which breaks PATH for the build tools: pick another folder" >&2; exit 2; fi
+    if [ "$url_given" -eq 1 ] && [ "$profile" != server ]; then echo "--public-url belongs to mimi-launch server" >&2; exit 2; fi
+    if [ "$url_given" -eq 1 ] && ! [[ $PUBLIC_URL =~ $URL_SHAPE ]]; then
+        echo "--public-url \"$PUBLIC_URL\" is not a URL: it starts with http:// or https:// and has no spaces" >&2
+        exit 2
+    fi
+    if [ -n "$dir" ]; then WS="$dir"; elif [ ! -f "$LAUNCH/repos" ]; then WS="$HOME/mimi-os"; fi
+    if [ -f "$WS/mimi-launch" ] && [ -f "$WS/repos" ]; then
+        if [ "$(basename "$(cd "$WS" && pwd)")" = launch ] && [ ! -e "$WS/.mimi-profile" ]; then
+            echo "$WS is launch itself: give the workspace, the folder above it" >&2
+            exit 2
+        fi
+        not_beside_workspace "$WS"
+    fi
+
+    command -v git >/dev/null || { echo "git not found on PATH" >&2; exit 1; }
+    if [ ! -f "$WS/launch/repos" ]; then
+        echo "==> cloning launch into $WS/launch"
+        mkdir -p "$WS"
+        git clone "$BASE/launch.git" "$WS/launch"
+    fi
+    WS="$(cd "$WS" && pwd)"
+    # always run the workspace's own copy, so a downloaded script never drifts from the checkout
+    if [ "$WS/launch" != "$LAUNCH" ]; then
+        exec bash "$WS/launch/mimi-launch" "$profile" ${flags[@]+"${flags[@]}"} ${PUBLIC_URL:+--public-url "$PUBLIC_URL"}
+    fi
+
+    preflight
+    # a run handed over by a self-update already asked: its answer came along in ARGV
+    if [ "$profile" = server ] && [ "$url_given" -eq 0 ] && [ -t 0 ] && [ -z "$REEXEC" ]; then
+        ASK_PUBLIC_URL=1
+        ask_public_url
+        if [ -n "$PUBLIC_URL" ]; then ARGV+=(--public-url "$PUBLIC_URL"); fi
+    fi
+    local previous
+    previous="$(profile)"
+    echo "$profile" > "$WS/.mimi-profile"
+    if [ "$previous" = none ] || [ "$previous" = "$profile" ]; then
+        echo "==> $profile workspace in $WS"
+    else
+        echo "==> $profile workspace in $WS, switched from $previous: repos only $previous used stay as they are"
+    fi
+
+    # written first, so a first run that stops at the health gate still leaves a mimi that runs this workspace
+    shim
+
+    update ${flags[@]+"${flags[@]}"}
+
+    echo
+    echo "mimi-os ($profile) is in $WS"
+    case "$profile" in
+        server)
+            local current
+            current="$(stored_public_url)"
+            echo "  public URL:         ${current:-not set (mimi public-url <url> sets it later)}"
+            echo "  pair the app:       mimi pair"
+            ;;
+        agents) echo "  build an agent:     in its folder, pnpm add $(printf %q "link:$WS/sdk") (and $(printf %q "link:$WS/plugins") for the packs)" ;;
+        devkit)
+            echo "  test your agent:    in its folder, pnpm add $(printf %q "link:$WS/sdk") and pnpm add -D $(printf %q "link:$WS/devkit"),"
+            echo "                      then pnpm exec mimi-dev up (devkit runs its own gateway)"
+            ;;
+    esac
+    echo "  update later:       $(printf %q "$LAUNCH")/mimi-launch update"
+}
+
+# MIMI_PUBLIC_URL as gateway/mimi/.env holds it, empty when unset; the file is read when the CLI is missing or too old
+stored_public_url() {
+    local out
+    if out="$(MIMI_HOME="$WS/gateway/mimi" node "$WS/gateway/dist/cli/mimi.js" public-url 2>/dev/null)"; then
+        echo "$out" | sed -n 's/^public URL: //p' | grep -vx 'not set' || true
+    elif [ -f "$WS/gateway/mimi/.env" ]; then
+        node -e 'const v = require("node:util").parseEnv(require("node:fs").readFileSync(process.argv[1], "utf8")).MIMI_PUBLIC_URL?.trim(); if (v) console.log(v)' \
+            "$WS/gateway/mimi/.env"
+    fi
+}
+
+# PUBLIC_URL: a confirmed answer that passed the light check, or empty when Enter keeps what is there
+ask_public_url() {
+    local current answer confirm tty
+    current="$(stored_public_url)"
+    PUBLIC_URL=""
+    while true; do
+        answer=""
+        if [ -n "$current" ]; then
+            read -r -p "Public URL the app dials [$current] (paste, Enter to keep it): " answer || echo
+        else
+            read -r -p 'Public URL the app dials (paste, Enter to skip): ' answer || echo
+        fi
+        # a terminal without icrnl hands a pasted CRLF over as a trailing CR; read already trimmed the spaces
+        answer="${answer//$'\r'/}"
+        if [ -z "$answer" ]; then
+            if [ -n "$current" ]; then echo "  → MIMI_PUBLIC_URL stays $current"; else echo "  → no public URL (mimi public-url <url> sets it later)"; fi
+            return 0
+        fi
+        if ! [[ $answer =~ $URL_SHAPE ]]; then
+            echo "  \"$answer\" is not a URL: it starts with http:// or https:// and has no spaces, like https://mimi.example.com:8443"
+            continue
+        fi
+        # a paste that ends in a line break (CRLF brings two) must not answer the question below: drop what is queued
+        tty="$(stty -g)"
+        stty -icanon min 0 time 0
+        while read -r _; do :; done
+        stty "$tty"
+        echo "  → MIMI_PUBLIC_URL = $answer"
+        confirm=""
+        read -r -p '  Correct? [Y/n] ' confirm || echo
+        case "$confirm" in [nN]*) continue ;; esac
+        PUBLIC_URL="$answer"
+        return 0
+    done
+}
+
+# ~/.local/bin/mimi runs the mimi CLI of the workspace it names; the agents profile has no gateway, so no shim
+shim() {
+    local path="$HOME/.local/bin/mimi" owner="# written by mimi-launch: the mimi CLI of the workspace $WS" body
+    if [ "$(profile)" = agents ]; then
+        if grep -qxF "$owner" "$path" 2>/dev/null; then
+            rm "$path"
+            echo "==> removed $path: it ran this workspace's gateway, and the agents profile has none"
+        fi
+        return 0
+    fi
+    body="$(printf '%s\n' '#!/usr/bin/env bash' "$owner" \
+        "export MIMI_HOME=$(printf %q "$WS/gateway/mimi")" \
+        "exec node $(printf %q "$WS/gateway/dist/cli/mimi.js") \"\$@\"")"
+    if [ "$(cat "$path" 2>/dev/null)" = "$body" ]; then return 0; fi
+    mkdir -p "$HOME/.local/bin"
+    echo "$body" > "$path"
+    chmod +x "$path"
+    echo "==> $path runs this workspace's mimi CLI"
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) echo "   ~/.local/bin is not on PATH: add  export PATH=\"\$HOME/.local/bin:\$PATH\"  to ~/.bashrc or ~/.zshrc" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- update
+
+# sets FAST, TESTS and RESTART for a run of `update` under this profile
+update_flags() {
+    local profile="$1" arg
+    shift
+    FAST=0 TESTS=0 RESTART=1
+    for arg in "$@"; do
+        case "$arg" in
+            --fast) FAST=1 ;;
+            --test) TESTS=1 ;;
+            --no-restart) RESTART=0 ;;
+            *) echo "unknown flag: $arg" >&2; exit 2 ;;
+        esac
+    done
+    if [ "$profile" = server ] && [ "$TESTS" -eq 1 ]; then
+        echo "update --test: a server has no sdk, and tests run where the sdk is (an agents or devkit workspace)" >&2
+        exit 2
+    fi
+}
+
+update() {
+    local out profile
+    need_workspace
+    profile="$(profile)"
+    case "$profile" in
+        server | agents | devkit) ;;
+        *) echo "$WS has no profile: run mimi-launch server|agents|devkit first" >&2; exit 1 ;;
+    esac
+    update_flags "$profile" "$@"
+    preflight
+
+    trap 'echo "==> FAILED: the tree may now hold an unverified build. The pull above names every repo it moved;
+    to go back, run git checkout ORIG_HEAD in each of them, then mimi-launch update --fast" >&2' ERR
+
+    echo "==> pull"
+    local repo dir before after dirty script
+    script="$(git -C "$LAUNCH" rev-parse HEAD:mimi-launch)"
+    for repo in $(present_repos); do
+        dir="$(dir_of "$repo")"
+        if ! git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null; then
+            echo "   - $repo: $(git -C "$dir" branch --show-current | grep . || echo "detached HEAD"), no upstream: not pulled, built as it is"
+            continue
+        fi
+        before="$(git -C "$dir" rev-parse --short HEAD)"
+        if ! out="$(git -C "$dir" pull -q --ff-only 2>&1)"; then
+            echo "   - $repo: pull failed, nothing was built: $out" >&2
+            exit 1
+        fi
+        after="$(git -C "$dir" rev-parse --short HEAD)"
+        dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
+        printf '   - %s: %s%s\n' "$repo" "$([ "$before" = "$after" ] && echo "up to date" || echo "$before..$after")" \
+            "$([ "$dirty" -eq 0 ] || echo ", $dirty uncommitted file(s) built as they are")"
+        # a pull that changed this file hands the whole run to the new one, once
+        if [ "$repo" = launch ] && [ "$(git -C "$LAUNCH" rev-parse HEAD:mimi-launch)" != "$script" ]; then
+            if ! out="$(bash -n "$LAUNCH/mimi-launch" 2>&1)"; then
+                git -C "$LAUNCH" reset -q --keep "$before"
+                echo "   the pulled mimi-launch does not parse, so launch is back at $before and nothing else was pulled or built:" >&2
+                echo "$out" >&2
+                exit 1
+            elif [ -n "$REEXEC" ]; then
+                echo "   mimi-launch changed again after restarting: this run goes on with the copy it read"
+            else
+                echo "   mimi-launch itself changed: running the new one with the same arguments"
+                exec env MIMI_LAUNCH_REEXEC=1 bash "$LAUNCH/mimi-launch" "${ARGV[@]}"
+            fi
+        fi
+    done
+
+    # a repo of this profile that is not here yet is cloned after the pull, so a `repos` fixed upstream counts
+    local name profiles url
+    while read -r name profiles url; do
+        case ",$profiles," in *",$profile,"*) ;; *) continue ;; esac
+        if [ -e "$WS/$name/.git" ]; then continue; fi
+        case "$url" in *://* | *@*:*) ;; *) url="$BASE/$url" ;; esac
+        echo "==> clone $name from $url"
+        if ! git clone -q "$url" "$WS/$name"; then echo "   - $name: clone failed, nothing was built" >&2; exit 1; fi
+    done < <(repo_lines)
+
+    echo "==> install (frozen lockfiles)"
+    # a stale lockfile stops here: regenerate it where you develop, never with --no-frozen-lockfile on a server
+    local pkg
+    for pkg in $(packages); do
+        echo "   - $pkg"
+        # pnpm's own output only when it fails
+        (cd "$WS/$pkg" && out="$(pnpm install --frozen-lockfile 2>&1)" || { echo "$out" >&2; exit 1; })
+    done
+
+    # every build empties its dist first, so a deleted source never leaves a stale module behind
+    echo "==> build (dependency order; tsc -p tsconfig.build.json typechecks all of src)"
+    for pkg in $(packages); do
+        echo "   - $pkg"
+        (cd "$WS/$pkg" && pnpm run -s build)
+    done
+
+    # the test typecheck and the tests import the sdk, which a server does not clone
+    if [ "$profile" = server ]; then
+        echo "==> no typecheck of the tests: a server has no sdk"
+    elif [ "$FAST" -eq 1 ]; then
+        echo "==> no typecheck (--fast)"
+    else
+        echo "==> typecheck, tests included"
+        for pkg in $(packages); do
+            echo "   - $pkg"
+            (cd "$WS/$pkg" && pnpm run -s check)
+        done
+    fi
+    if [ "$TESTS" -eq 1 ]; then
+        echo "==> test"
+        for pkg in $(packages); do
+            echo "   - $pkg"
+            (cd "$WS/$pkg" && pnpm test)
+        done
+    fi
+    trap - ERR
+
+    # only `mimi-launch server` sets PUBLIC_URL; the gateway checks it with the rule it boots with
+    local code
+    while [ -n "$PUBLIC_URL" ]; do
+        echo "==> public URL"
+        code=0
+        # pm2 drops every MIMI_ variable of this shell, so the file is what the gateway will read
+        env -u MIMI_PUBLIC_URL MIMI_HOME="$WS/gateway/mimi" node "$WS/gateway/dist/cli/mimi.js" public-url "$PUBLIC_URL" \
+            | sed 's/^/   /' || code=$?
+        if [ "$code" -eq 0 ]; then break; fi
+        if [ "$code" -ne 2 ]; then exit "$code"; fi
+        if [ "$ASK_PUBLIC_URL" -eq 0 ]; then
+            echo "   nothing was started: run mimi-launch server again with a URL the gateway accepts" >&2
+            exit 2
+        fi
+        ask_public_url
+    done
+
+    if [ "$profile" != server ]; then
+        echo "==> nothing to restart: the $profile profile runs nothing under pm2$([ "$profile" = agents ] || echo " (mimi-dev up runs the gateway)")"
+    elif [ "$RESTART" -eq 0 ]; then
+        echo "==> no restart (--no-restart)"
+    else
+        restart_stack
+    fi
+    # a shim this script wrote for a workspace whose gateway CLI is gone (moved or deleted) is replaced by this
+    # workspace's; one naming another live workspace is left alone
+    local named
+    named="$(sed -n 's/^# written by mimi-launch: the mimi CLI of the workspace //p' "$HOME/.local/bin/mimi" 2>/dev/null)" || true
+    if [ ! -e "$HOME/.local/bin/mimi" ] || { [ -n "$named" ] && [ ! -f "$named/gateway/dist/cli/mimi.js" ]; }; then shim; fi
+    echo "==> done"
+}
+
+# pm2 fixes an app's script path and env keys at its first start, then gates on health and 15 s of stability
+restart_stack() {
+    if ! command -v pm2 >/dev/null; then
+        echo "==> pm2 not found: nothing was restarted. Install it (npm i -g pm2), then run mimi-launch update" >&2
+        NOT_RESTARTED=1
+        return 0
+    fi
+    (cd "$LAUNCH" && node --input-type=module - <<'EOF'
+import { execFileSync } from "node:child_process";
+import { resolve } from "node:path";
+import ecosystem from "./ecosystem.config.js";
+
+const jlist = () => {
+    const out = execFileSync("pm2", ["jlist"], { encoding: "utf8" });
+    // pm2 may print warnings before the JSON line
+    return JSON.parse(out.split("\n").find((line) => /^\[[{\]]/.test(line)) ?? "[]");
+};
+
+console.log("==> pm2 reload");
+// a reload keeps an app's old script file and never drops an env key: such an app is deleted and started fresh
+const live = jlist();
+for (const app of ecosystem.apps) {
+    const current = live.find(({ name }) => name === app.name)?.pm2_env;
+    if (current === undefined) continue;
+    const path = resolve(app.cwd, app.script);
+    const leaked = Object.keys(current.env)
+        .filter((key) => app.filter_env.some((part) => key.includes(part)) && !(key in (app.env ?? {})));
+    if (current.pm_exec_path !== path) console.log(`   - ${app.name} runs ${current.pm_exec_path}, not ${path}`);
+    if (leaked.length > 0) console.log(`   - ${app.name} holds ${leaked.join(", ")} from an older deploy`);
+    if (current.pm_exec_path !== path || leaked.length > 0) {
+        console.log(`     delete ${app.name}, then start it fresh`);
+        execFileSync("pm2", ["delete", app.name], { stdio: "inherit" });
+    }
+}
+execFileSync("pm2", ["startOrReload", "ecosystem.config.js", "--update-env"], { stdio: "inherit" });
+
+const states = () => new Map(jlist().map(({ name, pm2_env }) => [name, { status: pm2_env.status, restarts: pm2_env.restart_time }]));
+
+console.log("==> health (gateway answers, every app stays online): a failure skips pm2 save");
+const health = "http://127.0.0.1:46464/api/health";
+const deadline = Date.now() + 60_000;
+while (!(await fetch(health, { signal: AbortSignal.timeout(2000) }).then((res) => res.ok, () => false))) {
+    if (Date.now() > deadline) {
+        const gateway = states().get("gateway");
+        console.error(`   ${health} did not answer 200 within 60 s (gateway ${gateway?.status ?? "missing"}, ${gateway?.restarts ?? 0} restarts): see pm2 logs gateway`);
+        process.exit(1);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+}
+
+const before = states();
+await new Promise((resolve) => setTimeout(resolve, 15_000));
+const after = states();
+const unstable = ecosystem.apps
+    .map((app) => app.name)
+    .filter((name) => after.get(name)?.status !== "online" || after.get(name)?.restarts !== before.get(name)?.restarts);
+if (unstable.length > 0) {
+    const detail = unstable.map((name) => `${name} (${after.get(name)?.status ?? "missing"}, ${after.get(name)?.restarts ?? 0} restarts)`);
+    console.error(`   not stable after 15 s: ${detail.join(", ")}: see pm2 logs <name>`);
+    process.exit(1);
+}
+console.log("   health 200, every app online with no restart in 15 s");
+EOF
+    )
+    pm2 save
+    pm2 status
+    if ! { command -v systemctl >/dev/null && systemctl is-enabled --quiet "pm2-$(id -un)"; }; then
+        echo "   WARN: no enabled pm2-$(id -un) unit: the stack will not come back after a reboot (run pm2 startup)" >&2
+    fi
+}
+
+# ---------------------------------------------------------------- check | status
+
+check() {
+    need_workspace
+    local repo dir n out
+    for repo in $(present_repos); do
+        dir="$(dir_of "$repo")"
+        if ! out="$(git -C "$dir" fetch -q 2>&1)"; then
+            printf '%-10s fetch failed: %s\n' "$repo" "$(echo "$out" | tail -1)"
+        elif ! git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null; then
+            printf '%-10s no upstream\n' "$repo"
+        else
+            n="$(git -C "$dir" rev-list --count 'HEAD..@{u}')"
+            if [ "$n" -eq 0 ]; then
+                printf '%-10s up to date\n' "$repo"
+            else
+                printf '%-10s %s new commit%s (%s)\n' "$repo" "$n" "$([ "$n" -eq 1 ] || echo s)" \
+                    "$(git -C "$dir" log --format=%s 'HEAD..@{u}' | paste -sd ';' - | sed 's/;/; /g')"
+            fi
+        fi
+    done
+}
+
+status() {
+    need_workspace
+    echo "profile: $(profile)"
+    local repo dir branch dirty ahead name profiles current
+    for repo in $(present_repos); do
+        dir="$(dir_of "$repo")"
+        branch="$(git -C "$dir" branch --show-current)"
+        dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
+        if git -C "$dir" rev-parse -q --verify '@{u}' >/dev/null; then
+            ahead="ahead $(git -C "$dir" rev-list --count '@{u}..HEAD'), behind $(git -C "$dir" rev-list --count 'HEAD..@{u}')"
+        else
+            ahead="no upstream"
+        fi
+        printf '%-10s %-12s %-10s %s\n' "$repo" "${branch:-detached}" "$([ "$dirty" -eq 0 ] && echo clean || echo "$dirty dirty")" "$ahead"
+        git -C "$dir" status --porcelain | sed -n '1,10p' | sed 's/^/             /'
+    done
+    current="$(profile)"
+    while read -r name profiles _; do
+        case ",$profiles," in
+            *",$current,"*) if [ ! -e "$WS/$name/.git" ]; then printf '%-10s missing: mimi-launch update clones it\n' "$name"; fi ;;
+            *) if [ -e "$WS/$name/.git" ]; then printf '%-10s not in the %s profile: left as it is\n' "$name" "$current"; fi ;;
+        esac
+    done < <(repo_lines)
+}
+
+# ---------------------------------------------------------------- reset
+
+reset() {
+    if [ $# -gt 0 ]; then echo "usage: mimi-launch reset (no flags: it resets the gateway's state)" >&2; exit 2; fi
+    need_workspace
+    if [ "$(profile)" = agents ]; then echo "reset: the agents profile runs no gateway, so it has no gateway state to reset" >&2; exit 1; fi
+    if [ "$(profile)" = devkit ]; then
+        echo "this resets the workspace's gateway (gateway/mimi, the one mimi start runs); mimi-dev's gateway keeps"
+        echo "its state in <agent folder>/.mimi-dev, which pnpm exec mimi-dev down --reset deletes"
+    fi
+    cd "$WS"
+    shopt -s nullglob
+    local existing=() path
+    for path in gateway/mimi/gateway.db* gateway/mimi/.channel.key gateway/mimi/.local-token gateway/mimi/gateway.log* gateway/mimi/gateway.pid; do
+        if [ -e "$path" ]; then existing+=("$path"); fi
+    done
+    if [ ${#existing[@]} -eq 0 ]; then echo "nothing to reset"; return 0; fi
+
+    echo "will delete:"
+    for path in "${existing[@]}"; do printf '   %6s  %s\n' "$(du -sh "$path" | cut -f1)" "$path"; done
+    echo "stays:"
+    for path in gateway/mimi/.env gateway/mimi/.env.keys; do if [ -e "$path" ]; then echo "           $path"; fi; done
+    echo "           every .env and .env.keys, and all code"
+
+    local backup
+    backup="$HOME/mimi-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar -czf "$backup" "${existing[@]}"
+    echo "backup: $backup ($(du -h "$backup" | cut -f1); the .env files are not in it, they stay)"
+
+    local answer=""
+    read -r -p 'type RESET to delete the list above: ' answer || true
+    if [ "$answer" != RESET ]; then echo "not reset; nothing deleted (the backup stays)"; exit 1; fi
+
+    if [ "$(profile)" = server ] && command -v pm2 >/dev/null; then
+        echo "==> pm2 stop"
+        # an app that never started is not an error here
+        pm2 stop "$LAUNCH/ecosystem.config.js" >/dev/null 2>&1 || true
+    elif [ -f gateway/mimi/gateway.pid ] && [ -f gateway/dist/cli/mimi.js ]; then
+        echo "==> mimi stop"
+        MIMI_HOME="$WS/gateway/mimi" node gateway/dist/cli/mimi.js stop || true
+    fi
+    rm -rf "${existing[@]}"
+    echo "==> deleted ${#existing[@]} paths"
+
+    if [ "$(profile)" = server ]; then
+        restart_stack
+    else
+        echo "   $(profile): restart what you run by hand (mimi start for the gateway)"
+    fi
+    echo "next: pair the app again with mimi pair"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+    BASE="${MIMI_GIT_BASE:-https://github.com/Mimi-agent-os}"
+    local self="${BASH_SOURCE[0]}" link
+    # run through a symlink, launch is still the folder of the real file, and the workspace its parent
+    while link="$(readlink "$self")"; do
+        case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+    done
+    LAUNCH="$(cd "$(dirname "$self")" && pwd)"
+    WS="$(dirname "$LAUNCH")"
+    ARGV=("$@")
+    NOT_RESTARTED=0
+    PUBLIC_URL="" ASK_PUBLIC_URL=0
+    # the light check before the gateway's own: a scheme and no spaces
+    URL_SHAPE='^https?://[^[:space:]]+$'
+    # set only by the run that pulled a new mimi-launch and handed over to it; no child inherits it
+    REEXEC="${MIMI_LAUNCH_REEXEC:-}"
+    unset MIMI_LAUNCH_REEXEC
+
+    if [ -f "$LAUNCH/repos" ] && { [ "$(basename "$LAUNCH")" != launch ] || [ -e "$LAUNCH/.mimi-profile" ]; }; then
+        not_beside_workspace "$LAUNCH"
+    fi
+
+    local cmd="${1:-}"
+    if [ $# -gt 0 ]; then shift; fi
+    case "$cmd" in
+        server | agents | devkit) setup "$cmd" "$@" ;;
+        update) update "$@" ;;
+        check) check ;;
+        status) status ;;
+        reset) reset "$@" ;;
+        *) usage ;;
+    esac
+    return "$NOT_RESTARTED"
+}
+
+main "$@"; exit

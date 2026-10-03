@@ -1,0 +1,7 @@
+# The repos cloned beside launch in the workspace, in build order. mimi-launch reads this file.
+# name     profiles                url (relative to MIMI_GIT_BASE, default https://github.com/Mimi-agent-os)
+protocol   server,agents,devkit    protocol.git
+sdk        agents,devkit           sdk.git
+plugins    agents,devkit           plugins.git
+gateway    server,devkit           gateway.git
+devkit     devkit                  devkit.git

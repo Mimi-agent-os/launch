@@ -1,0 +1,3 @@
+# launch holds only its own files: the workspace, its repos and local state sit beside it
+node_modules/
+.env*
